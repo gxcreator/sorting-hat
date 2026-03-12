@@ -2,6 +2,7 @@
 # hat — the Sorting Hat: suggests appropriate filenames based on file contents
 # Uses any OpenAI-compatible API (local or remote) with optional vision support
 set -euo pipefail
+# set -x
 
 LLM_BASE_URL="${LLM_BASE_URL:-http://localhost:8080}"
 HAT_MODEL="${HAT_MODEL:-gpt-4o}"
@@ -34,6 +35,7 @@ Options:
   --outdir, -o    Copy renamed file to this directory instead of renaming in place
   --budget, -rb   Reasoning token budget (default: 1024, -1 for unlimited)
   --nothink       Disable thinking entirely (equivalent to --budget 0)
+  --jobs, -j      Parallel requests for batch processing (default: 1)
 
 Environment:
   LLM_BASE_URL             OpenAI-compatible base URL (default: http://localhost:8080)
@@ -77,14 +79,19 @@ build_payload() {
   local preserve_ext="$3"
   local ext="${file##*.}"
 
+  local basename
+  basename=$(basename "$file")
   local ext_instruction="Choose an appropriate extension."
   if [[ "$preserve_ext" == "true" && -n "$ext" && "$ext" != "$file" ]]; then
     ext_instruction="Keep the extension as .$ext."
   fi
 
-  local prompt="You are a file naming assistant. Suggest a single appropriate filename. Rules:
+  local prompt="You are a file naming assistant. Suggest a single appropriate filename.
+Original filename: $basename
+Rules:
 - Use lowercase with hyphens (kebab-case), no spaces
-- Be descriptive but concise (2-5 words)
+- If the original filename or content contains a date, you MUST include it as a prefix (e.g. 2024-03-15_)
+- Be descriptive but concise (4-10 words)
 - $ext_instruction
 - Reply with ONLY the filename, nothing else"
 
@@ -507,12 +514,14 @@ process_file() {
   # Output for scripting (stdout)
   echo "$suggested"
 
+  echo "  [debug] do_rename=$do_rename outdir='$outdir' dir='$dir' suggested='$suggested'" >&2
   if [[ "$do_rename" != "false" ]]; then
     local target_dir="$dir"
     if [[ -n "$outdir" ]]; then
       target_dir="$outdir"
     fi
     local target="$target_dir/$suggested"
+    echo "  [debug] target='$target' file='$file'" >&2
     if [[ -z "$outdir" && "$target" == "$file" ]]; then
       echo "  (already named correctly)" >&2
       return 0
@@ -539,7 +548,9 @@ process_file() {
     if [[ -n "$outdir" ]]; then
       verb="Copied" op="cp"
     fi
+    echo "  [debug] verb=$verb op=$op do_rename=$do_rename" >&2
     if [[ "$do_rename" == "auto" ]]; then
+      echo "  [debug] executing: $op '$file' '$target'" >&2
       $op "$file" "$target"
       echo "  $verb → $target" >&2
     else
@@ -561,6 +572,7 @@ BATCH=false
 FORCE_IMAGE=false
 PRESERVE_EXT=true
 QUIET=false
+JOBS=1
 OUTDIR=""
 FILES=()
 
@@ -577,6 +589,7 @@ while [[ $# -gt 0 ]]; do
     --outdir|-o) OUTDIR="$2"; shift 2 ;;
     --budget|-rb) REASONING_BUDGET="$2"; shift 2 ;;
     --nothink) REASONING_BUDGET=0; shift ;;
+    --jobs|-j) JOBS="$2"; shift 2 ;;
     -*) echo "Unknown option: $1" >&2; exit 1 ;;
     *) FILES+=("$1"); shift ;;
   esac
@@ -607,27 +620,118 @@ for target in "${FILES[@]}"; do
 done
 
 TOTAL=${#ALL_FILES[@]}
-CURRENT=0
 TOTAL_TIME=0
 
-for f in "${ALL_FILES[@]}"; do
-  ((CURRENT++)) || true
-  if [[ $TOTAL -gt 1 ]]; then
-    progress="[$CURRENT/$TOTAL]"
-    if [[ $CURRENT -gt 1 && $TOTAL_TIME -gt 0 ]]; then
-      avg=$(( TOTAL_TIME / (CURRENT - 1) ))
-      remaining=$(( (TOTAL - CURRENT + 1) * avg ))
-      printf '  %s avg %.1fs/file, ~%ds remaining\n' "$progress" "$(echo "scale=1; $avg / 1000" | bc)" "$(( remaining / 1000 ))" >&2
-    else
-      echo "  $progress" >&2
-    fi
-  fi
+if [[ $JOBS -gt 1 && $TOTAL -gt 1 ]]; then
+  # Parallel mode: fetch suggestions and apply immediately
+  RESULT_DIR=$(mktemp -d)
+  cleanup_results() { rm -rf "$RESULT_DIR"; }
+  trap cleanup_results EXIT
+
+  echo "  Processing $TOTAL files ($JOBS parallel)..." >&2
+
   START_MS=$(($(date +%s%N) / 1000000))
-  process_file "$f" "$DO_RENAME" "$PRESERVE_EXT" "$FORCE_IMAGE" "$QUIET" "$OUTDIR"
+
+  for i in "${!ALL_FILES[@]}"; do
+    (
+      f="${ALL_FILES[$i]}"
+      bname=$(basename "$f")
+      num=$((i + 1))
+      mode="text"
+      if [[ "$FORCE_IMAGE" == "true" ]] || is_image "$f"; then
+        mode="image"
+      fi
+      if [[ "$mode" == "text" ]] && is_binary "$f"; then
+        echo "  [$num/$TOTAL] $bname: binary file, skipped" >&2
+        exit 0
+      fi
+      FILE_START=$(($(date +%s%N) / 1000000))
+      suggested=$(suggest_quiet "$f" "$mode" "$PRESERVE_EXT")
+      FILE_END=$(($(date +%s%N) / 1000000))
+      FILE_ELAPSED=$((FILE_END - FILE_START))
+      if [[ -z "$suggested" ]]; then
+        printf '  [%d/%d] %s → (no suggestion) (%.1fs)\n' "$num" "$TOTAL" "$bname" "$(echo "scale=1; $FILE_ELAPSED / 1000" | bc)" >&2
+        exit 0
+      fi
+
+      echo "$suggested" > "$RESULT_DIR/$i"
+
+      # Apply rename/copy immediately
+      if [[ "$DO_RENAME" != "false" ]]; then
+        dir=$(dirname "$f")
+        target_dir="$dir"
+        [[ -n "$OUTDIR" ]] && target_dir="$OUTDIR"
+        target="$target_dir/$suggested"
+
+        if [[ -z "$OUTDIR" && "$target" == "$f" ]]; then
+          printf '  [%d/%d] %s (already named correctly) (%.1fs)\n' "$num" "$TOTAL" "$bname" "$(echo "scale=1; $FILE_ELAPSED / 1000" | bc)" >&2
+          exit 0
+        fi
+
+        if [[ -e "$target" ]]; then
+          if [[ "$suggested" == *.* ]]; then
+            base="${suggested%.*}"
+            ext_part=".${suggested##*.}"
+          else
+            base="$suggested"
+            ext_part=""
+          fi
+          counter=1
+          while [[ -e "$target_dir/${base}-${counter}${ext_part}" ]]; do
+            ((counter++))
+          done
+          suggested="${base}-${counter}${ext_part}"
+          target="$target_dir/$suggested"
+        fi
+
+        verb="Renamed" op="mv"
+        [[ -n "$OUTDIR" ]] && verb="Copied" op="cp"
+
+        if [[ "$DO_RENAME" == "auto" ]]; then
+          $op "$f" "$target"
+          printf '  [%d/%d] %s → %s (%s, %.1fs)\n' "$num" "$TOTAL" "$bname" "$suggested" "$verb" "$(echo "scale=1; $FILE_ELAPSED / 1000" | bc)" >&2
+        else
+          printf '  [%d/%d] %s → %s (%.1fs)\n' "$num" "$TOTAL" "$bname" "$suggested" "$(echo "scale=1; $FILE_ELAPSED / 1000" | bc)" >&2
+        fi
+      else
+        printf '  [%d/%d] %s → %s (%.1fs)\n' "$num" "$TOTAL" "$bname" "$suggested" "$(echo "scale=1; $FILE_ELAPSED / 1000" | bc)" >&2
+      fi
+    ) &
+    # Wait for all jobs in the batch before submitting more
+    if (( (i + 1) % JOBS == 0 )); then
+      wait
+    fi
+  done
+  wait
+
   END_MS=$(($(date +%s%N) / 1000000))
-  ELAPSED=$((END_MS - START_MS))
-  TOTAL_TIME=$((TOTAL_TIME + ELAPSED))
-done
+  TOTAL_TIME=$((END_MS - START_MS))
+
+  rm -rf "$RESULT_DIR"
+  trap - EXIT
+else
+  # Sequential mode (original behavior)
+  CURRENT=0
+  for f in "${ALL_FILES[@]}"; do
+    ((CURRENT++)) || true
+    if [[ $TOTAL -gt 1 ]]; then
+      progress="[$CURRENT/$TOTAL]"
+      if [[ $CURRENT -gt 1 && $TOTAL_TIME -gt 0 ]]; then
+        avg=$(( TOTAL_TIME / (CURRENT - 1) ))
+        remaining=$(( (TOTAL - CURRENT + 1) * avg ))
+        printf '  %s avg %.1fs/file, ~%ds remaining\n' "$progress" "$(echo "scale=1; $avg / 1000" | bc)" "$(( remaining / 1000 ))" >&2
+      else
+        echo "  $progress" >&2
+      fi
+    fi
+    START_MS=$(($(date +%s%N) / 1000000))
+    process_file "$f" "$DO_RENAME" "$PRESERVE_EXT" "$FORCE_IMAGE" "$QUIET" "$OUTDIR"
+    END_MS=$(($(date +%s%N) / 1000000))
+    ELAPSED=$((END_MS - START_MS))
+    TOTAL_TIME=$((TOTAL_TIME + ELAPSED))
+    printf '  %s took %.1fs\n' "$(basename "$f")" "$(echo "scale=1; $ELAPSED / 1000" | bc)" >&2
+  done
+fi
 
 if [[ $TOTAL -gt 1 ]]; then
   avg=$(echo "scale=1; $TOTAL_TIME / $TOTAL / 1000" | bc)
