@@ -594,14 +594,43 @@ if [[ -n "$OUTDIR" ]]; then
   mkdir -p "$OUTDIR"
 fi
 
+# Collect all files to process
+ALL_FILES=()
 for target in "${FILES[@]}"; do
   if [[ "$BATCH" == "true" && -d "$target" ]]; then
-    echo "Sorting files in $target:" >&2
     for f in "$target"/*; do
-      [[ -f "$f" ]] || continue
-      process_file "$f" "$DO_RENAME" "$PRESERVE_EXT" "$FORCE_IMAGE" "$QUIET" "$OUTDIR"
+      [[ -f "$f" ]] && ALL_FILES+=("$f")
     done
   else
-    process_file "$target" "$DO_RENAME" "$PRESERVE_EXT" "$FORCE_IMAGE" "$QUIET" "$OUTDIR"
+    ALL_FILES+=("$target")
   fi
 done
+
+TOTAL=${#ALL_FILES[@]}
+CURRENT=0
+TOTAL_TIME=0
+
+for f in "${ALL_FILES[@]}"; do
+  ((CURRENT++)) || true
+  if [[ $TOTAL -gt 1 ]]; then
+    progress="[$CURRENT/$TOTAL]"
+    if [[ $CURRENT -gt 1 && $TOTAL_TIME -gt 0 ]]; then
+      avg=$(( TOTAL_TIME / (CURRENT - 1) ))
+      remaining=$(( (TOTAL - CURRENT + 1) * avg ))
+      printf '  %s avg %.1fs/file, ~%ds remaining\n' "$progress" "$(echo "scale=1; $avg / 1000" | bc)" "$(( remaining / 1000 ))" >&2
+    else
+      echo "  $progress" >&2
+    fi
+  fi
+  START_MS=$(($(date +%s%N) / 1000000))
+  process_file "$f" "$DO_RENAME" "$PRESERVE_EXT" "$FORCE_IMAGE" "$QUIET" "$OUTDIR"
+  END_MS=$(($(date +%s%N) / 1000000))
+  ELAPSED=$((END_MS - START_MS))
+  TOTAL_TIME=$((TOTAL_TIME + ELAPSED))
+done
+
+if [[ $TOTAL -gt 1 ]]; then
+  avg=$(echo "scale=1; $TOTAL_TIME / $TOTAL / 1000" | bc)
+  total_s=$(echo "scale=1; $TOTAL_TIME / 1000" | bc)
+  echo "  Done: $TOTAL files in ${total_s}s (avg ${avg}s/file)" >&2
+fi
