@@ -36,6 +36,7 @@ Options:
   --budget, -rb   Reasoning token budget (default: 1024, -1 for unlimited)
   --nothink       Disable thinking entirely (equivalent to --budget 0)
   --jobs, -j      Parallel requests for batch processing (default: 1)
+  --retries, -r   Retry failed jobs N times (default: 0)
 
 Environment:
   LLM_BASE_URL             OpenAI-compatible base URL (default: http://localhost:8080)
@@ -86,12 +87,21 @@ build_payload() {
     ext_instruction="Keep the extension as .$ext."
   fi
 
+  # Get file creation date (birth time), fall back to modification time
+  local file_date
+  file_date=$(stat --format='%w' "$file" 2>/dev/null | cut -d' ' -f1)
+  if [[ -z "$file_date" || "$file_date" == "-" ]]; then
+    file_date=$(stat --format='%y' "$file" 2>/dev/null | cut -d' ' -f1)
+  fi
+
   local prompt="You are a file naming assistant. Suggest a single appropriate filename.
 Original filename: $basename
 Rules:
 - Use lowercase with hyphens (kebab-case), no spaces
 - If the original filename or content contains a date, you MUST include it as a prefix (e.g. 2024-03-15_)
-- Be descriptive but concise (4-10 words)
+- If the original filename or content does not contain a date, use $file_date as prefix
+- Separate prefix from the rest of the name with an underscore, e.g. 2024-03-15_report-analysis.jpg
+- Be descriptive but concise (4-12 words)
 - $ext_instruction
 - Reply with ONLY the filename, nothing else"
 
@@ -573,6 +583,7 @@ FORCE_IMAGE=false
 PRESERVE_EXT=true
 QUIET=false
 JOBS=1
+RETRIES=0
 OUTDIR=""
 FILES=()
 
@@ -590,6 +601,7 @@ while [[ $# -gt 0 ]]; do
     --budget|-rb) REASONING_BUDGET="$2"; shift 2 ;;
     --nothink) REASONING_BUDGET=0; shift ;;
     --jobs|-j) JOBS="$2"; shift 2 ;;
+    --retries|-r) RETRIES="$2"; shift 2 ;;
     -*) echo "Unknown option: $1" >&2; exit 1 ;;
     *) FILES+=("$1"); shift ;;
   esac
@@ -632,77 +644,101 @@ if [[ $JOBS -gt 1 && $TOTAL -gt 1 ]]; then
 
   START_MS=$(($(date +%s%N) / 1000000))
 
-  for i in "${!ALL_FILES[@]}"; do
-    (
-      f="${ALL_FILES[$i]}"
-      bname=$(basename "$f")
-      num=$((i + 1))
-      mode="text"
-      if [[ "$FORCE_IMAGE" == "true" ]] || is_image "$f"; then
-        mode="image"
-      fi
-      if [[ "$mode" == "text" ]] && is_binary "$f"; then
-        echo "  [$num/$TOTAL] $bname: binary file, skipped" >&2
-        exit 0
-      fi
-      FILE_START=$(($(date +%s%N) / 1000000))
-      suggested=$(suggest_quiet "$f" "$mode" "$PRESERVE_EXT")
-      FILE_END=$(($(date +%s%N) / 1000000))
-      FILE_ELAPSED=$((FILE_END - FILE_START))
-      if [[ -z "$suggested" ]]; then
-        printf '  [%d/%d] %s → (no suggestion) (%.1fs)\n' "$num" "$TOTAL" "$bname" "$(echo "scale=1; $FILE_ELAPSED / 1000" | bc)" >&2
-        exit 0
-      fi
-
-      echo "$suggested" > "$RESULT_DIR/$i"
-
-      # Apply rename/copy immediately
-      if [[ "$DO_RENAME" != "false" ]]; then
-        dir=$(dirname "$f")
-        target_dir="$dir"
-        [[ -n "$OUTDIR" ]] && target_dir="$OUTDIR"
-        target="$target_dir/$suggested"
-
-        if [[ -z "$OUTDIR" && "$target" == "$f" ]]; then
-          printf '  [%d/%d] %s (already named correctly) (%.1fs)\n' "$num" "$TOTAL" "$bname" "$(echo "scale=1; $FILE_ELAPSED / 1000" | bc)" >&2
+  run_parallel_batch() {
+    local indices=("$@")
+    for i in "${indices[@]}"; do
+      (
+        f="${ALL_FILES[$i]}"
+        bname=$(basename "$f")
+        num=$((i + 1))
+        mode="text"
+        if [[ "$FORCE_IMAGE" == "true" ]] || is_image "$f"; then
+          mode="image"
+        fi
+        if [[ "$mode" == "text" ]] && is_binary "$f"; then
+          echo "  [$num/$TOTAL] $bname: binary file, skipped" >&2
+          touch "$RESULT_DIR/$i.skip"
+          exit 0
+        fi
+        FILE_START=$(($(date +%s%N) / 1000000))
+        suggested=$(suggest_quiet "$f" "$mode" "$PRESERVE_EXT")
+        FILE_END=$(($(date +%s%N) / 1000000))
+        FILE_ELAPSED=$((FILE_END - FILE_START))
+        if [[ -z "$suggested" ]]; then
+          printf '  [%d/%d] %s → (no suggestion) (%.1fs)\n' "$num" "$TOTAL" "$bname" "$(echo "scale=1; $FILE_ELAPSED / 1000" | bc)" >&2
           exit 0
         fi
 
-        if [[ -e "$target" ]]; then
-          if [[ "$suggested" == *.* ]]; then
-            base="${suggested%.*}"
-            ext_part=".${suggested##*.}"
-          else
-            base="$suggested"
-            ext_part=""
-          fi
-          counter=1
-          while [[ -e "$target_dir/${base}-${counter}${ext_part}" ]]; do
-            ((counter++))
-          done
-          suggested="${base}-${counter}${ext_part}"
+        echo "$suggested" > "$RESULT_DIR/$i"
+
+        # Apply rename/copy immediately
+        if [[ "$DO_RENAME" != "false" ]]; then
+          dir=$(dirname "$f")
+          target_dir="$dir"
+          [[ -n "$OUTDIR" ]] && target_dir="$OUTDIR"
           target="$target_dir/$suggested"
-        fi
 
-        verb="Renamed" op="mv"
-        [[ -n "$OUTDIR" ]] && verb="Copied" op="cp"
+          if [[ -z "$OUTDIR" && "$target" == "$f" ]]; then
+            printf '  [%d/%d] %s (already named correctly) (%.1fs)\n' "$num" "$TOTAL" "$bname" "$(echo "scale=1; $FILE_ELAPSED / 1000" | bc)" >&2
+            exit 0
+          fi
 
-        if [[ "$DO_RENAME" == "auto" ]]; then
-          $op "$f" "$target"
-          printf '  [%d/%d] %s → %s (%s, %.1fs)\n' "$num" "$TOTAL" "$bname" "$suggested" "$verb" "$(echo "scale=1; $FILE_ELAPSED / 1000" | bc)" >&2
+          if [[ -e "$target" ]]; then
+            if [[ "$suggested" == *.* ]]; then
+              base="${suggested%.*}"
+              ext_part=".${suggested##*.}"
+            else
+              base="$suggested"
+              ext_part=""
+            fi
+            counter=1
+            while [[ -e "$target_dir/${base}-${counter}${ext_part}" ]]; do
+              ((counter++))
+            done
+            suggested="${base}-${counter}${ext_part}"
+            target="$target_dir/$suggested"
+          fi
+
+          verb="Renamed" op="mv"
+          [[ -n "$OUTDIR" ]] && verb="Copied" op="cp"
+
+          if [[ "$DO_RENAME" == "auto" ]]; then
+            $op "$f" "$target"
+            printf '  [%d/%d] %s → %s (%s, %.1fs)\n' "$num" "$TOTAL" "$bname" "$suggested" "$verb" "$(echo "scale=1; $FILE_ELAPSED / 1000" | bc)" >&2
+          else
+            printf '  [%d/%d] %s → %s (%.1fs)\n' "$num" "$TOTAL" "$bname" "$suggested" "$(echo "scale=1; $FILE_ELAPSED / 1000" | bc)" >&2
+          fi
         else
           printf '  [%d/%d] %s → %s (%.1fs)\n' "$num" "$TOTAL" "$bname" "$suggested" "$(echo "scale=1; $FILE_ELAPSED / 1000" | bc)" >&2
         fi
-      else
-        printf '  [%d/%d] %s → %s (%.1fs)\n' "$num" "$TOTAL" "$bname" "$suggested" "$(echo "scale=1; $FILE_ELAPSED / 1000" | bc)" >&2
+      ) &
+      # Wait for all jobs in the batch before submitting more
+      if (( (${#indices[@]} > JOBS) && ((i + 1) % JOBS == 0) )); then
+        wait
       fi
-    ) &
-    # Wait for all jobs in the batch before submitting more
-    if (( (i + 1) % JOBS == 0 )); then
-      wait
+    done
+    wait
+  }
+
+  # Initial run with all file indices
+  INDICES=("${!ALL_FILES[@]}")
+  run_parallel_batch "${INDICES[@]}"
+
+  # Retry failed jobs
+  for (( attempt=1; attempt<=RETRIES; attempt++ )); do
+    FAILED=()
+    for i in "${INDICES[@]}"; do
+      if [[ ! -f "$RESULT_DIR/$i" && ! -f "$RESULT_DIR/$i.skip" ]]; then
+        FAILED+=("$i")
+      fi
+    done
+    if [[ ${#FAILED[@]} -eq 0 ]]; then
+      break
     fi
+    echo "  Retry $attempt/$RETRIES: ${#FAILED[@]} failed jobs..." >&2
+    run_parallel_batch "${FAILED[@]}"
+    INDICES=("${FAILED[@]}")
   done
-  wait
 
   END_MS=$(($(date +%s%N) / 1000000))
   TOTAL_TIME=$((END_MS - START_MS))
@@ -725,7 +761,15 @@ else
       fi
     fi
     START_MS=$(($(date +%s%N) / 1000000))
-    process_file "$f" "$DO_RENAME" "$PRESERVE_EXT" "$FORCE_IMAGE" "$QUIET" "$OUTDIR"
+    for (( attempt=0; attempt<=RETRIES; attempt++ )); do
+      if [[ $attempt -gt 0 ]]; then
+        echo "  Retry $attempt/$RETRIES: $(basename "$f")" >&2
+      fi
+      if process_file "$f" "$DO_RENAME" "$PRESERVE_EXT" "$FORCE_IMAGE" "$QUIET" "$OUTDIR"; then
+        break
+      fi
+      [[ $attempt -eq $RETRIES ]] && true
+    done
     END_MS=$(($(date +%s%N) / 1000000))
     ELAPSED=$((END_MS - START_MS))
     TOTAL_TIME=$((TOTAL_TIME + ELAPSED))
